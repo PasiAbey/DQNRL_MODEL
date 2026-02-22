@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+gunicorn
+azure-data-tables
+torch
+numpy
+scikit-learn
+pandas
