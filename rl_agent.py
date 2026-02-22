@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.optim as optim
 import random
 from collections import deque
+import os
 
 # --- DEEP Q-NETWORK ---
 class DQN(nn.Module):
@@ -29,6 +30,16 @@ class RLAgent:
         self.loss_fn = nn.MSELoss()
         self.gamma = 0.95
         self.memory = deque(maxlen=2000)
+
+    # NEW: Function to safely load your Colab .pth file on a cloud CPU
+    def load_pretrained_model(self, filepath):
+        if os.path.exists(filepath):
+            checkpoint = torch.load(filepath, map_location=torch.device('cpu'), weights_only=False)
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            print(f"✅ Successfully loaded pre-trained model from {filepath}")
+        else:
+            print(f"⚠️ Warning: Model file {filepath} not found. Using untrained, random weights.")
 
     def choose_action(self, state_vector):
         state_tensor = torch.FloatTensor(state_vector)
