@@ -50,13 +50,11 @@ def calculate_reward_score(recent_points, total_badges_count):
 # ---------------------------------------------------------
 # API ROUTES
 # ---------------------------------------------------------
-# We updated the payload to accept the raw student data needed for the math!
 class PredictRequest(BaseModel):
     level: str
     duration_norm: float
     consecutive_norm: float
     daily_xp_norm: float
-    # Raw stats for the Risk Model
     active_minutes: float
     quiz_accuracy: float
     modules_done: int
@@ -76,22 +74,21 @@ async def root():
 async def predict_action(req: PredictRequest):
     interaction_id = str(uuid.uuid4())
     
-    # 1. Calculate the Risk Score on the fly
+    # Calculate Risk
     eng_score = calculate_engagement(req.active_minutes, req.quiz_accuracy, req.modules_done, req.days_since_last_login)
     rew_score = calculate_reward_score(req.recent_points, req.total_badges_count)
-    
     student_features = np.array([[eng_score, rew_score]])
     retention_prob = risk_model.predict_proba(student_features)[0][1]
-    calculated_risk_score = 1.0 - retention_prob # dropout risk
+    calculated_risk_score = 1.0 - retention_prob 
     
-    # 2. Feed the dynamic risk score into the RL Agent
+    # Get Action
     state_vector = get_rl_state_vector(
         req.level, req.duration_norm, calculated_risk_score, 
         req.quiz_accuracy, req.consecutive_norm, req.daily_xp_norm
     )
     action_id = agent.choose_action(state_vector)
     
-    # 3. Save memory to Azure
+    # Save to Azure
     if pending_client:
         entity = {
             "PartitionKey": "LiveInteractions",
@@ -102,11 +99,51 @@ async def predict_action(req: PredictRequest):
         }
         pending_client.create_entity(entity=entity)
     
-    # Return both the action AND the dynamically calculated risk score!
     return {
         "interaction_id": interaction_id, 
         "action_id": action_id,
         "risk_score": float(calculated_risk_score)
     }
 
-# ... (Keep your existing @app.post("/feedback") route exactly the same here) ...
+@app.post("/feedback")
+async def receive_feedback(req: FeedbackRequest):
+    if not pending_client or not replay_client:
+        return {"status": "error", "message": "Database not connected."}
+
+    try:
+        # Retrieve short-term memory
+        entity = pending_client.get_entity(partition_key="LiveInteractions", row_key=req.interaction_id)
+        
+        # 13-Hour Expiration Check
+        saved_time = datetime.fromisoformat(entity["Timestamp_UTC"])
+        if datetime.now(timezone.utc) - saved_time > timedelta(hours=13):
+            pending_client.delete_entity(partition_key="LiveInteractions", row_key=req.interaction_id)
+            return {"status": "ignored", "message": "Interaction expired."}
+            
+        # Unpack saved data
+        old_state = json.loads(entity["StateVector"])
+        action_taken = entity["ActionId"]
+        
+        # Calculate Reward
+        reward = 10.0 if req.engaged else -10.0
+        
+        # Move to permanent ExperienceReplay table for batch training
+        replay_entity = {
+            "PartitionKey": "BatchData",
+            "RowKey": str(uuid.uuid4()),
+            "State": json.dumps(old_state),
+            "Action": int(action_taken),
+            "Reward": float(reward),
+            "NextState": json.dumps(old_state),
+            "Done": True,
+            "Timestamp_UTC": datetime.now(timezone.utc).isoformat()
+        }
+        replay_client.create_entity(entity=replay_entity)
+        
+        # Clean up short-term database
+        pending_client.delete_entity(partition_key="LiveInteractions", row_key=req.interaction_id)
+        
+        return {"status": "success", "message": f"Experience saved for batch training with reward: {reward}"}
+        
+    except Exception as e:
+        raise HTTPException(status_code=404, detail="Interaction ID not found.")
