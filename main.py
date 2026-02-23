@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from azure.data.tables import TableServiceClient
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 import uuid
 import json
 import os
@@ -111,23 +111,17 @@ async def receive_feedback(req: FeedbackRequest):
         return {"status": "error", "message": "Database not connected."}
 
     try:
-        # Retrieve short-term memory
+        # 1. Retrieve short-term memory
         entity = pending_client.get_entity(partition_key="LiveInteractions", row_key=req.interaction_id)
         
-        # 13-Hour Expiration Check
-        saved_time = datetime.fromisoformat(entity["Timestamp_UTC"])
-        if datetime.now(timezone.utc) - saved_time > timedelta(hours=13):
-            pending_client.delete_entity(partition_key="LiveInteractions", row_key=req.interaction_id)
-            return {"status": "ignored", "message": "Interaction expired."}
-            
-        # Unpack saved data
+        # 2. Unpack saved data
         old_state = json.loads(entity["StateVector"])
         action_taken = entity["ActionId"]
         
-        # Calculate Reward
+        # 3. Calculate Reward 
         reward = 10.0 if req.engaged else -10.0
         
-        # Move to permanent ExperienceReplay table for batch training
+        # 4. Move to permanent ExperienceReplay table for batch training
         replay_entity = {
             "PartitionKey": "BatchData",
             "RowKey": str(uuid.uuid4()),
@@ -140,7 +134,7 @@ async def receive_feedback(req: FeedbackRequest):
         }
         replay_client.create_entity(entity=replay_entity)
         
-        # Clean up short-term database
+        # 5. Clean up short-term database
         pending_client.delete_entity(partition_key="LiveInteractions", row_key=req.interaction_id)
         
         return {"status": "success", "message": f"Experience saved for batch training with reward: {reward}"}
