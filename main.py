@@ -7,13 +7,19 @@ import json
 import os
 from rl_agent import RLAgent, get_rl_state_vector
 
-app = FastAPI(title="New RL Platform API")
+app = FastAPI(title="Skill-Quest RL API")
 
 # Configure Azure Table Storage
 CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+pending_client = None
+replay_client = None
+
 if CONNECTION_STRING:
     table_service = TableServiceClient.from_connection_string(conn_str=CONNECTION_STRING)
-    table_client = table_service.create_table_if_not_exists(table_name="PendingInteractions")
+    # Table 1: Short-term memory for the 12-hour delay
+    pending_client = table_service.create_table_if_not_exists(table_name="PendingInteractions")
+    # Table 2: Long-term memory for the nightly Batch Training script
+    replay_client = table_service.create_table_if_not_exists(table_name="ExperienceReplay")
 
 # Initialize the RL Agent and load the pre-trained weights
 agent = RLAgent()
@@ -33,6 +39,11 @@ class FeedbackRequest(BaseModel):
     interaction_id: str
     engaged: bool
 
+@app.get("/")
+async def root():
+    """Simple health check so the main domain doesn't return a 404."""
+    return {"status": "online", "service": "Skill-Quest Inference API"}
+
 @app.post("/predict")
 async def predict_action(req: PredictRequest):
     interaction_id = str(uuid.uuid4())
@@ -45,7 +56,7 @@ async def predict_action(req: PredictRequest):
     action_id = agent.choose_action(state_vector)
     
     # Save the 12-hour memory to Azure Table Storage
-    if CONNECTION_STRING:
+    if pending_client:
         entity = {
             "PartitionKey": "LiveInteractions",
             "RowKey": interaction_id,
@@ -53,39 +64,49 @@ async def predict_action(req: PredictRequest):
             "ActionId": action_id,
             "Timestamp_UTC": datetime.now(timezone.utc).isoformat()
         }
-        table_client.create_entity(entity=entity)
+        pending_client.create_entity(entity=entity)
     
     return {"interaction_id": interaction_id, "action_id": action_id}
 
 @app.post("/feedback")
 async def receive_feedback(req: FeedbackRequest):
-    if not CONNECTION_STRING:
+    if not pending_client or not replay_client:
         return {"status": "error", "message": "Database not connected."}
 
     try:
-        # Retrieve the memory
-        entity = table_client.get_entity(partition_key="LiveInteractions", row_key=req.interaction_id)
+        # 1. Retrieve the short-term memory
+        entity = pending_client.get_entity(partition_key="LiveInteractions", row_key=req.interaction_id)
         
-        # 13-Hour Expiration Check Workaround
+        # 2. 13-Hour Expiration Check Workaround
         saved_time = datetime.fromisoformat(entity["Timestamp_UTC"])
         if datetime.now(timezone.utc) - saved_time > timedelta(hours=13):
-            table_client.delete_entity(partition_key="LiveInteractions", row_key=req.interaction_id)
+            pending_client.delete_entity(partition_key="LiveInteractions", row_key=req.interaction_id)
             return {"status": "ignored", "message": "Interaction expired."}
             
-        # Unpack the saved data
+        # 3. Unpack the saved data
         old_state = json.loads(entity["StateVector"])
         action_taken = entity["ActionId"]
         
-        # Assign the reward based on engagement
+        # 4. Assign the reward based on engagement
         reward = 10.0 if req.engaged else -10.0
         
-        # Save to agent memory for future retraining
-        agent.remember(old_state, action_taken, reward, next_state=old_state, done=True)
+        # 5. Save experience to long-term storage for the nightly batch training
+        replay_entity = {
+            "PartitionKey": "BatchData",
+            "RowKey": str(uuid.uuid4()),
+            "State": json.dumps(old_state),
+            "Action": int(action_taken),
+            "Reward": float(reward),
+            "NextState": json.dumps(old_state), # Using old_state as terminal state
+            "Done": True,
+            "Timestamp_UTC": datetime.now(timezone.utc).isoformat()
+        }
+        replay_client.create_entity(entity=replay_entity)
         
-        # Clean up database to save budget
-        table_client.delete_entity(partition_key="LiveInteractions", row_key=req.interaction_id)
+        # 6. Clean up the short-term database to save budget
+        pending_client.delete_entity(partition_key="LiveInteractions", row_key=req.interaction_id)
         
-        return {"status": "success", "message": f"Learned with reward: {reward}"}
+        return {"status": "success", "message": f"Experience saved for batch training with reward: {reward}"}
         
     except Exception as e:
         raise HTTPException(status_code=404, detail="Interaction ID not found.")

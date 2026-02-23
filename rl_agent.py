@@ -17,6 +17,7 @@ class DQN(nn.Module):
             nn.ReLU(),
             nn.Linear(64, output_size)
         )
+        
     def forward(self, x):
         return self.net(x)
 
@@ -29,20 +30,30 @@ class RLAgent:
         self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
         self.loss_fn = nn.MSELoss()
         self.gamma = 0.95
+        
+        # Epsilon variables needed for the replay function and saving state
+        self.epsilon = 0.01
+        self.epsilon_min = 0.01
+        self.epsilon_decay = 0.995
+        
         self.memory = deque(maxlen=2000)
 
-    # NEW: Function to safely load your Colab .pth file on a cloud CPU
+    # Function to safely load your Colab .pth file on a cloud CPU
     def load_pretrained_model(self, filepath):
         if os.path.exists(filepath):
             checkpoint = torch.load(filepath, map_location=torch.device('cpu'), weights_only=False)
             self.model.load_state_dict(checkpoint['model_state_dict'])
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            # Safely load epsilon if it exists in the checkpoint
+            self.epsilon = checkpoint.get('epsilon', 0.01)
             print(f"✅ Successfully loaded pre-trained model from {filepath}")
         else:
             print(f"⚠️ Warning: Model file {filepath} not found. Using untrained, random weights.")
 
     def choose_action(self, state_vector):
         state_tensor = torch.FloatTensor(state_vector)
+        # In production, we usually stick to greedy actions (no random exploration) 
+        # to ensure the user gets the best possible prediction.
         with torch.no_grad():
             q_values = self.model(state_tensor)
             action = torch.argmax(q_values).item()
@@ -50,6 +61,37 @@ class RLAgent:
 
     def remember(self, state, action, reward, next_state, done):
         self.memory.append((state, action, reward, next_state, done))
+
+    # NEW: The backpropagation engine used by train.py
+    def replay(self, batch_size=32):
+        if len(self.memory) < batch_size:
+            return False
+
+        minibatch = random.sample(self.memory, batch_size)
+
+        for state, action, reward, next_state, done in minibatch:
+            state_t = torch.FloatTensor(state)
+            next_state_t = torch.FloatTensor(next_state)
+            target = reward
+
+            # Bellman Equation
+            if not done:
+                target = reward + self.gamma * torch.max(self.model(next_state_t)).item()
+
+            target_f = self.model(state_t).clone()
+            target_f[action] = target
+
+            # Gradient Descent
+            self.optimizer.zero_grad()
+            loss = self.loss_fn(self.model(state_t), target_f)
+            loss.backward()
+            self.optimizer.step()
+
+        # Decay epsilon
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+
+        return True
 
 # --- STATE VECTOR BUILDER ---
 def get_rl_state_vector(level, duration_norm, risk_score, quiz_norm, consecutive_norm, daily_xp_norm):
