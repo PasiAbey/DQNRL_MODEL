@@ -24,12 +24,10 @@ if CONNECTION_STRING:
 # ---------------------------------------------------------
 # LOAD THE DOUBLE BRAINS
 # ---------------------------------------------------------
-# 1. Load the RL Agent
 agent = RLAgent()
 rl_model_path = os.path.join(os.path.dirname(__file__), "trained_rl_agent.pth")
 agent.load_pretrained_model(rl_model_path)
 
-# 2. Load the Risk Predictor
 risk_model_path = os.path.join(os.path.dirname(__file__), "trained_risk_model.joblib")
 risk_model = joblib.load(risk_model_path)
 
@@ -53,8 +51,8 @@ def calculate_reward_score(recent_points, total_badges_count):
 class PredictRequest(BaseModel):
     level: str
     duration_norm: float
-    consecutive_norm: float
-    daily_xp_norm: float
+    consecutive: float         # Changed from consecutive_norm
+    daily_xp: float            # Changed from daily_xp_norm
     active_minutes: float
     quiz_accuracy: float
     modules_done: int
@@ -81,10 +79,14 @@ async def predict_action(req: PredictRequest):
     retention_prob = risk_model.predict_proba(student_features)[0][1]
     calculated_risk_score = 1.0 - retention_prob 
     
+    # Apply Internal Normalization
+    calculated_consecutive_norm = min(req.consecutive / 10.0, 1.0)
+    calculated_daily_xp_norm = float(np.tanh(req.daily_xp / 500.0))
+    
     # Get Action
     state_vector = get_rl_state_vector(
         req.level, req.duration_norm, calculated_risk_score, 
-        req.quiz_accuracy, req.consecutive_norm, req.daily_xp_norm
+        req.quiz_accuracy, calculated_consecutive_norm, calculated_daily_xp_norm
     )
     action_id = agent.choose_action(state_vector)
     
@@ -111,17 +113,13 @@ async def receive_feedback(req: FeedbackRequest):
         return {"status": "error", "message": "Database not connected."}
 
     try:
-        # 1. Retrieve short-term memory
         entity = pending_client.get_entity(partition_key="LiveInteractions", row_key=req.interaction_id)
         
-        # 2. Unpack saved data
         old_state = json.loads(entity["StateVector"])
         action_taken = entity["ActionId"]
         
-        # 3. Calculate Reward 
         reward = 10.0 if req.engaged else -10.0
         
-        # 4. Move to permanent ExperienceReplay table for batch training
         replay_entity = {
             "PartitionKey": "BatchData",
             "RowKey": str(uuid.uuid4()),
@@ -133,8 +131,6 @@ async def receive_feedback(req: FeedbackRequest):
             "Timestamp_UTC": datetime.now(timezone.utc).isoformat()
         }
         replay_client.create_entity(entity=replay_entity)
-        
-        # 5. Clean up short-term database
         pending_client.delete_entity(partition_key="LiveInteractions", row_key=req.interaction_id)
         
         return {"status": "success", "message": f"Experience saved for batch training with reward: {reward}"}
