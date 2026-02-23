@@ -9,6 +9,7 @@ from rl_agent import RLAgent
 # Configuration
 CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
 MODEL_PATH = "trained_rl_agent.pth"
+MAX_MEMORIES = 2000  # The maximum number of past experiences to keep in Azure
 
 def run_nightly_training():
     print("=" * 50)
@@ -20,7 +21,7 @@ def run_nightly_training():
         return
 
     try:
-        # 1. Connect to Azure Table Storage (Need both tables now)
+        # 1. Connect to Azure Table Storage
         table_service = TableServiceClient.from_connection_string(conn_str=CONNECTION_STRING)
         pending_client = table_service.get_table_client(table_name="PendingInteractions")
         replay_client = table_service.get_table_client(table_name="ExperienceReplay")
@@ -36,7 +37,6 @@ def run_nightly_training():
     swept_count = 0
 
     try:
-        # Look through everything currently pending
         for entity in pending_client.list_entities():
             entity_time_str = entity.get("Timestamp_UTC")
             if not entity_time_str:
@@ -45,15 +45,14 @@ def run_nightly_training():
             try:
                 entity_time = datetime.fromisoformat(entity_time_str)
             except ValueError:
-                continue # Skip if date format is corrupted
+                continue 
 
-            # If it's older than 12 hours, the backend never sent a success signal
+            # If it's older than 12 hours, punish it with -10.0
             if entity_time < cutoff_time:
                 try:
                     state_vector_str = entity["StateVector"]
                     action_id = entity["ActionId"]
 
-                    # Move to Experience Replay with a -10.0 penalty
                     replay_entity = {
                         "PartitionKey": "BatchData",
                         "RowKey": str(uuid.uuid4()),
@@ -65,8 +64,6 @@ def run_nightly_training():
                         "Timestamp_UTC": datetime.now(timezone.utc).isoformat()
                     }
                     replay_client.create_entity(entity=replay_entity)
-
-                    # Delete from Pending
                     pending_client.delete_entity(partition_key=entity["PartitionKey"], row_key=entity["RowKey"])
                     swept_count += 1
                 except Exception as e:
@@ -76,23 +73,21 @@ def run_nightly_training():
     except Exception as e:
         print(f"⚠️ Error during auto-sweep: {e}")
 
-
     # ==========================================
     # STEP 2: FETCH & TRAIN
     # ==========================================
     print("📡 STEP 2: Fetching experiences from Azure Table Storage...")
     try:
-        # Fetch all saved experiences (which now includes the auto-swept ones!)
         entities = list(replay_client.list_entities())
     except Exception as e:
-        print(f"❌ Error reading table (it may be empty or not exist yet): {e}")
+        print(f"❌ Error reading table: {e}")
         return
 
     if not entities:
         print("💤 No new experiences found today. Skipping training.")
         return
 
-    print(f"📊 Found {len(entities)} new experiences. Initializing RL Agent...")
+    print(f"📊 Found {len(entities)} total experiences in the memory bank.")
 
     # Initialize Agent and Load Current Brain
     agent = RLAgent()
@@ -102,8 +97,7 @@ def run_nightly_training():
     else:
         print("⚠️ No existing model found. Training from scratch.")
 
-    # Load Data into the Agent's Short-Term Memory
-    processed_rows = []
+    # Load ALL Data into the Agent's Short-Term Memory
     for entity in entities:
         try:
             state = json.loads(entity["State"])
@@ -111,9 +105,7 @@ def run_nightly_training():
             reward = float(entity["Reward"])
             next_state = json.loads(entity["NextState"])
             done = entity["Done"]
-
             agent.remember(state, action, reward, next_state, done)
-            processed_rows.append(entity)
         except Exception as e:
             print(f"⚠️ Skipping corrupted row {entity.get('RowKey')}: {e}")
 
@@ -121,10 +113,11 @@ def run_nightly_training():
         print("⚠️ No valid memories to train on.")
         return
 
-    # Train the Neural Network
+    # Train the Neural Network using Random Sampling from the Buffer
     batch_size = min(32, len(agent.memory))
-    num_updates = max(1, len(processed_rows) // batch_size)
-    print(f"⚙️ Running {num_updates} training epoch(s) with batch size {batch_size}...")
+    # Run training proportional to how much data we have (approx 1 epoch)
+    num_updates = max(1, len(entities) // batch_size) 
+    print(f"⚙️ Running {num_updates} training batches (Size: {batch_size})...")
     
     for _ in range(num_updates):
         agent.replay(batch_size=batch_size)
@@ -137,18 +130,29 @@ def run_nightly_training():
         'epsilon': agent.epsilon
     }, MODEL_PATH)
 
-    # Clean Up the Database
-    print("🧹 Cleaning up processed experiences from Azure...")
-    deleted_count = 0
-    for row in processed_rows:
-        try:
-            replay_client.delete_entity(partition_key=row["PartitionKey"], row_key=row["RowKey"])
-            deleted_count += 1
-        except Exception as e:
-            print(f"⚠️ Failed to delete row {row['RowKey']}: {e}")
+    # ==========================================
+    # STEP 3: MANAGE THE ROLLING BUFFER
+    # ==========================================
+    print("🧹 STEP 3: Managing Experience Replay database size...")
+    
+    # Sort all experiences by their timestamp (oldest first)
+    entities.sort(key=lambda x: x.get("Timestamp_UTC", ""))
+    
+    if len(entities) > MAX_MEMORIES:
+        excess_count = len(entities) - MAX_MEMORIES
+        rows_to_delete = entities[:excess_count] # Grab the oldest rows
+        deleted_count = 0
+        for row in rows_to_delete:
+            try:
+                replay_client.delete_entity(partition_key=row["PartitionKey"], row_key=row["RowKey"])
+                deleted_count += 1
+            except Exception as e:
+                print(f"⚠️ Failed to delete old row: {e}")
+        print(f"✅ Cleaned up {deleted_count} old memories. Kept the freshest {MAX_MEMORIES}.")
+    else:
+        print(f"✅ Database has {len(entities)} memories. No cleanup needed yet.")
 
-    print(f"✅ Successfully deleted {deleted_count} rows.")
-    print("🎉 Nightly training complete! The AI is now smarter.")
+    print("🎉 Nightly training complete! The AI is now smarter and the database is optimized.")
     print("=" * 50)
 
 if __name__ == "__main__":
