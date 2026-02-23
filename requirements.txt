@@ -7,3 +7,4 @@ azure-data-tables
 numpy
 scikit-learn
 pandas
+joblib
